@@ -1,0 +1,127 @@
+import numpy as np
+import cv2
+
+def resize_to_width(img, target_width=400):
+    h, w = img.shape[:2]
+    scale = target_width / w
+    new_h = int(h * scale)
+    return cv2.resize(img, (target_width, new_h), interpolation=cv2.INTER_AREA)
+
+# 1. โหลดภาพต้นแบบ
+img_milo = cv2.imread('MiloNugget.jpg', 0) 
+img_pocky = cv2.imread('MatchaPocky.jpg', 0)
+
+if img_milo is None or img_pocky is None:
+    print("Error: Image not found.")
+    exit()
+
+# ปรับขนาดภาพต้นแบบให้เล็กลง (Fix ความกว้างที่ 400px กำลังดีสำหรับ SIFT)
+img_milo = resize_to_width(img_milo, 400)
+img_pocky = resize_to_width(img_pocky, 400)
+
+# 2. ตั้งค่า Detector
+detector = cv2.SIFT_create()
+matcher = cv2.BFMatcher()
+
+kp_milo, des_milo = detector.detectAndCompute(img_milo, None)
+kp_pocky, des_pocky = detector.detectAndCompute(img_pocky, None)
+
+cap = cv2.VideoCapture(0)
+
+def find_and_draw_box(frame, target_kp, target_des, ref_img, ref_kp, ref_des, color, label):
+    if target_des is None or len(target_kp) < 2:
+        return frame
+
+    matches = matcher.knnMatch(ref_des, target_des, k=2)
+
+    good = []
+    try:
+        for m, n in matches:
+            # ปรับให้เข้มงวดขึ้น (0.7) เพื่อลดจุดมั่วจากแสงสะท้อน
+            if m.distance < 0.7 * n.distance:
+                good.append(m)
+    except ValueError:
+        pass
+
+    # เพิ่มจำนวนจุดขั้นต่ำเป็น 20-25 เพื่อความชัวร์
+    MIN_MATCH_COUNT = 20
+    
+    if len(good) > MIN_MATCH_COUNT:
+        src_pts = np.float32([ref_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst_pts = np.float32([target_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+
+        if M is not None:
+            h, w = ref_img.shape
+            pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
+            
+            try:
+                dst = cv2.perspectiveTransform(pts, M)
+                
+                # --- Sanity Checks (ตรวจสอบความสมเหตุสมผล) ---
+                
+                # 1. เช็คว่าเป็นรูปสี่เหลี่ยมนูน (ไม่บิดเป็นเลข 8)
+                if not cv2.isContourConvex(np.int32(dst)):
+                    return frame
+
+                # 2. เช็คพื้นที่ (Area)
+                area = cv2.contourArea(np.int32(dst))
+                frame_area = frame.shape[0] * frame.shape[1]
+                # ต้องไม่เล็กกว่า 2000 และไม่ใหญ่เกิน 60% ของจอ (ของเดิมบินไปทั่วจอเพราะไม่มี limit บน)
+                if area < 2000 or area > (frame_area * 0.6):
+                    return frame
+
+                # 3. เช็คสัดส่วน (Aspect Ratio Consistency) - แก้ปัญหา Milo บิดเบี้ยว
+                x, y, w_rect, h_rect = cv2.boundingRect(np.int32(dst))
+                aspect_ratio_detected = w_rect / h_rect
+                aspect_ratio_ref = w / h
+                
+                # ยอมให้สัดส่วนเพี้ยนได้ไม่เกิน 50% (เช่น ซองจริงจัตุรัส แต่เจอเป็นผืนผ้ายาวๆ -> ตัดทิ้ง)
+                if not (0.5 * aspect_ratio_ref < aspect_ratio_detected < 1.5 * aspect_ratio_ref):
+                    return frame
+
+                # ถ้าผ่านทุกด่าน ค่อยวาด
+                cv2.polylines(frame, [np.int32(dst)], True, color, 3, cv2.LINE_AA)
+                
+                # วาดชื่อ
+                lbl_x = max(0, x)
+                lbl_y = max(20, y)
+                cv2.putText(frame, f"{label}", (lbl_x, lbl_y - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            except Exception:
+                pass
+
+    return frame
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # ลบ equalizeHist ออก เพราะทำให้แสงสะท้อนบนถุงไมโลแย่ลง
+    # แต่เพิ่ม GaussianBlur นิดหน่อยเพื่อลด Noise ในภาพ Webcam
+    gray_frame = cv2.GaussianBlur(gray_frame, (5, 5), 0)
+
+    kp_frame, des_frame = detector.detectAndCompute(gray_frame, None)
+
+    # ตรวจจับ Milo
+    frame = find_and_draw_box(frame, kp_frame, des_frame, 
+                              img_milo, kp_milo, des_milo, 
+                              (0, 255, 0), "Milo")
+
+    # ตรวจจับ Pocky
+    frame = find_and_draw_box(frame, kp_frame, des_frame, 
+                              img_pocky, kp_pocky, des_pocky, 
+                              (0, 0, 255), "Pocky")
+
+    cv2.imshow('Snack Detector v2', frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
